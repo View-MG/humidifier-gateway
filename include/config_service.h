@@ -13,8 +13,11 @@ public:
     
     void sendBool(const String& path, bool value);
     bool readBool(const String& path);
-    FirebaseData fbdo;
 
+    String readString(const String& path);
+    void sendString(const String &path, const String &value);
+
+    FirebaseData fbdo;
 private:
     FirebaseAuth auth;
     FirebaseConfig config;
