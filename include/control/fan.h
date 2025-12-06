@@ -68,22 +68,36 @@ private:
             // ปกติ 12:00 → 17:00
             return (nowMin >= schedStartMin && nowMin < schedStopMin);
         } else {
-            // ข้ามเที่ยงคืน 22:00 → 05:00
+            // (ยังไม่ได้รองรับเคสข้ามเที่ยงคืนแบบละเอียด ใช้เคสปกติเป็นหลัก)
             return (nowMin >= schedStartMin || nowMin < schedStopMin);
         }
     }
 
-    // ---------- countdown logic ----------
-    void updateCountdown(time_t now, FirebaseData* fb) {
-        if (!schedEnable || schedStartMin < 0) return;
+    // ---------- countdown ----------
+    // ก่อนถึง start → นับถอยหลังถึง start
+    // ระหว่าง schedule ทำงาน → นับถอยหลังถึง stop
+    void updateCountdown(time_t now, FirebaseData* fb, bool inWin) {
+        if (!schedEnable || schedStartMin < 0 || schedStopMin < 0) return;
 
         int h,m,s;
         getNowHMS(now,h,m,s);
         int nowSec   = h*3600 + m*60 + s;
         int startSec = schedStartMin * 60;
+        int stopSec  = schedStopMin  * 60;
 
-        int diff = startSec - nowSec;
-        // ถ้าเลยเวลา start วันนี้แล้ว → นับเป็น 0 ไป
+        int diff = 0;
+
+        if (inWin) {
+            // กำลังทำงาน → นับถอยหลังถึง stop
+            diff = stopSec - nowSec;
+        } else {
+            // ยังไม่ถึงเวลา start → นับถอยหลังถึง start
+            if (nowSec <= startSec)
+                diff = startSec - nowSec;
+            else
+                diff = 0;   // เลย stop แล้ว
+        }
+
         if (diff < 0) diff = 0;
 
         bool shouldUpdate = false;
@@ -154,12 +168,12 @@ public:
             lastCfg = millis();
         }
 
-        // ---------- 2) update countdown ----------
-        updateCountdown(now, fb);
+        // ---------- 2) schedule window + countdown ----------
+        bool inWin = inScheduleWindow(now);
+        updateCountdown(now, fb, inWin);
 
         // ---------- 3) คำนวณ state ที่ “ควร” เป็น ----------
         bool want = false;
-        bool inWin = inScheduleWindow(now);
 
         if (schedEnable && inWin) {
             // ถึงเวลาตั้งเวลา → บังคับเปิด

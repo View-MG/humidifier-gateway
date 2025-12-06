@@ -29,6 +29,9 @@ private:
     uint8_t mismatchCount      = 0;
     const uint8_t MAX_RECOVERY = 3;
 
+    // countdown
+    unsigned long lastCountdownUpdate = 0;
+
     // ---------- helper: เวลา ----------
     int parseHHMM(const String& s) {
         int c = s.indexOf(':');
@@ -61,24 +64,35 @@ private:
         if (schedStartMin <= schedStopMin) {
             return (nowMin >= schedStartMin && nowMin < schedStopMin);
         } else {
+            // ข้ามเที่ยงคืน (ยังไม่รองรับละเอียด ใช้เคสปกติเป็นหลัก)
             return (nowMin >= schedStartMin || nowMin < schedStopMin);
         }
     }
 
-    // ใช้ logic countdown เดียวกัน เพื่อให้สองไฟล์คล้ายกัน
-    void updateCountdown(time_t now, FirebaseData* fb) {
-        if (!schedEnable || schedStartMin < 0) return;
+    // ---------- countdown ----------
+    void updateCountdown(time_t now, FirebaseData* fb, bool inWin) {
+        if (!schedEnable || schedStartMin < 0 || schedStopMin < 0) return;
 
         int h,m,s;
         getNowHMS(now,h,m,s);
         int nowSec   = h*3600 + m*60 + s;
         int startSec = schedStartMin * 60;
+        int stopSec  = schedStopMin  * 60;
 
-        int diff = startSec - nowSec;
+        int diff = 0;
+
+        if (inWin) {
+            // อยู่ในช่วง schedule → นับไปจนถึงเวลาปิด
+            diff = stopSec - nowSec;
+        } else {
+            // ยังไม่เริ่ม → นับไปจนถึงเวลาเริ่ม
+            if (nowSec <= startSec)
+                diff = startSec - nowSec;
+            else
+                diff = 0;
+        }
+
         if (diff < 0) diff = 0;
-
-        // NOTE: เพื่อเลี่ยงเขียน Firebase ซ้ำถี่ ๆ
-        static unsigned long lastCountdownUpdate = 0;
 
         bool shouldUpdate = false;
 
@@ -145,12 +159,12 @@ public:
             lastCfg = millis();
         }
 
-        // ---------- 2) update countdown ให้ behavior เหมือน Fan ----------
-        updateCountdown(now, fb);
+        // ---------- 2) schedule window + countdown ----------
+        bool inWin = inScheduleWindow(now);
+        updateCountdown(now, fb, inWin);
 
         // ---------- 3) ตัดสินใจ state ----------
         bool want = false;
-        bool inWin = inScheduleWindow(now);
 
         if (schedEnable && inWin) {
             want = true;  // บังคับเปิดช่วง schedule
