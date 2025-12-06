@@ -1,92 +1,103 @@
 #include <Arduino.h>
 #include <time.h>
-#include "config_service.h"
-#include "sensor_service.h"
-#include "motor_control.h"
-#include "log_service.h"
-#include "audio_service.h"
+#include "constant.h"
+#include "gateway.h"
+#include "control/fan.h"
+#include "control/steam.h"
+#include "audio.h" 
+#include "log.h"   
 
-// Services
-ConfigService config;
-SensorService sensor;
-MotorControl motor;
-LogService* logger;
+// --- Objects ---
+GatewayNetwork network;
 AudioService audio;
+FanLogic fanLogic(&network);
+SteamLogic steamLogic(&network);
+LogService logger(&network); 
 
-// --- ตัวแปรสำหรับจับเวลา (Non-blocking) ---
+// --- Data ---
+SensorPacket currentSensorData;
+bool isSensorDataNew = false;
+
+// --- Timers ---
+unsigned long lastLogicTime = 0;
 unsigned long lastLogTime = 0;
-const unsigned long LOG_INTERVAL = 30000; // 30 วินาที (Log Firebase)
 
-unsigned long lastSensorTime = 0;
-const unsigned long SENSOR_INTERVAL = 500; // 0.5 วินาที (อ่าน Sensor/คุม Motor)
+// ==========================================
+// 🚀 FreeRTOS Task: สำหรับ Audio โดยเฉพาะ
+// ==========================================
+TaskHandle_t AudioTaskHandle;
+
+void AudioTask(void * parameter) {
+    Serial.println("[System] Audio Task Started on Core 0");
+    
+    // Loop นี้จะทำงานแยกอิสระ ไม่สน main loop
+    while(true) {
+        if (ENABLE_AUDIO_STREAM) {
+            audio.loop(); 
+        }
+        
+        // ใส่ delay สั้นมากๆ เพื่อให้ Watchdog Timer ไม่ทำงานผิดพลาด (สำคัญ)
+        // 1 tick ประมาณ 1ms ซึ่งอาจจะทำให้เสียงขาดนิดหน่อย
+        // แต่ถ้าไม่ใส่เลย Task อาจจะกิน CPU จนระบบรวน
+        // ลองใส่ 1 ก่อน ถ้าเสียงกระตุก ให้ลองเอาออก หรือใช้ vTaskDelay(0);
+        vTaskDelay(1 / portTICK_PERIOD_MS); 
+    }
+}
 
 void setup() {
     Serial.begin(115200);
 
-    // 1. Init System
-    config.beginWiFi();
-    config.beginFirebase();
+    // 1. Init Network
+    network.begin();
 
-    motor.begin(&config);
-    sensor.begin();
-
-    // 2. Init Audio (ถ้าเปิด)
+    // 2. Init Audio Hardware
     if (ENABLE_AUDIO_STREAM) {
         audio.begin();
     }
 
-    // 3. Init Logger
-    logger = new LogService(&config);
-    logger->begin();
+    // 3. Init Time
+    configTime(7 * 3600, 0, "pool.ntp.org");
+    Serial.println("[Gateway] System Started");
 
-    Serial.println("[System] Ready");
+    // -----------------------------------------------------------
+    // 4. สร้าง Task แยกไปรันที่ Core 0
+    // -----------------------------------------------------------
+    if (ENABLE_AUDIO_STREAM) {
+        xTaskCreatePinnedToCore(
+            AudioTask,      // ฟังก์ชัน Task
+            "AudioTask",    // ชื่อ Task
+            10000,          // Stack Size (10kb น่าจะพอ)
+            NULL,           // Parameter
+            1,              // Priority (1 = สูงกว่า Idle)
+            &AudioTaskHandle, // Handle
+            0               // Run on Core 0 (Main loop อยู่ Core 1)
+        );
+    }
 }
 
 void loop() {
     // -----------------------------------------------------------
-    // PRIORITY 1: Audio Service (ต้องทำงานทุกรอบ ห้ามรอ!)
+    // Core 1: ทำงาน Logic + Firebase + ESP-NOW
+    // (Audio ถูกย้ายออกไปแล้ว ไม่ต้องใส่ตรงนี้)
     // -----------------------------------------------------------
-    if (ENABLE_AUDIO_STREAM) {
-        audio.loop(); 
-    }
 
-    // -----------------------------------------------------------
-    // PRIORITY 2: Sensor & Motor Control (ทำทุกๆ 500ms)
-    // -----------------------------------------------------------
-    if (millis() - lastSensorTime > SENSOR_INTERVAL) {
-        lastSensorTime = millis(); // รีเซ็ตเวลา
+    time_t now = time(nullptr);
 
-        // อ่านค่า Sensor
-        float temperature = sensor.getTemperature();
-        float humidity    = sensor.getHumidity();
-        float water       = sensor.getWaterLevel();
-        bool tilted       = (sensor.getTiltDegree() > 0);
-        bool button       = sensor.getButton();
-
-        // ควบคุม Motor
-        motor.update(true); 
-
-        // (Optional) ปริ้นดูสถานะได้ตรงนี้ ถ้าอยาก Debug
-        // Serial.printf("T:%.1f H:%.1f W:%.1f Tilt:%d\n", temperature, humidity, water, tilted);
-    }
-
-    // -----------------------------------------------------------
-    // PRIORITY 3: Logging (ทำทุกๆ 30 วินาที)
-    // -----------------------------------------------------------
-    if (millis() - lastLogTime > LOG_INTERVAL) {
-        lastLogTime = millis();
+    // 1. Process Logic (ทุก 1 วินาที)
+    if (millis() - lastLogicTime > LOGIC_INTERVAL_MS) {
+        lastLogicTime = millis();
         
-        // อ่านค่าล่าสุดอีกทีเพื่อให้ Log ตรงปัจจุบันที่สุด
-        logger->writeLog(
-            sensor.getTemperature(), 
-            sensor.getHumidity(), 
-            sensor.getWaterLevel(), 
-            sensor.getTiltDegree(), 
-            sensor.getButton()
-        );
-        Serial.println("[System] Log Sent to Firebase");
+        // ช่วงนี้ Firebase อาจจะดึงเวลาไป 1-2 วิ
+        // แต่ Audio บน Core 0 จะยังทำงานต่อได้ ไม่หลุด!
+        fanLogic.update(now, currentSensorData);
+        steamLogic.update(now, currentSensorData);
+        
+        isSensorDataNew = false; 
     }
 
-    // ❌ ห้ามใส่ delay() ตรงนี้เด็ดขาด! 
-    // ถ้าใส่ delay(500) เสียงจะกระตุกและ WS จะหลุดทันที
+    // 2. Data Logging (ทุก 30 วินาที)
+    // if (millis() - lastLogTime > LOG_INTERVAL_MS) {
+    //     lastLogTime = millis();
+    //     logger.writeLog(currentSensorData); 
+    // }
 }
