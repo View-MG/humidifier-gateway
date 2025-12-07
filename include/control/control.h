@@ -4,7 +4,7 @@
 #include <math.h>
 #include "gateway.h"
 #include "constant.h"
-#include "sensor/sensor.h"    // <- DHT (KY-015) logic แยกออกมาแล้ว
+#include "sensor/sensor.h"    // <- KY-015 (EnvSensorService)
 
 class ControlLogic {
 private:
@@ -38,6 +38,9 @@ private:
 
     // countdown schedule
     unsigned long lastCountdownUpdate = 0;
+
+    // safety master switch (compile-time)
+    const bool safetyEnabled = SAFETY_ENABLE_DEFAULT;
 
     // ---------- Sensor push -> Firebase ----------
     SensorPacket   lastSensor{};
@@ -77,14 +80,14 @@ private:
             // เคสปกติ 12:00 → 17:00
             return (nowMin >= schedStartMin && nowMin < schedStopMin);
         } else {
-            // เคสข้ามเที่ยงคืน (อาจปรับเพิ่มได้ภายหลัง)
+            // เคสข้ามเที่ยงคืน
             return (nowMin >= schedStartMin || nowMin < schedStopMin);
         }
     }
 
     // ---------- countdown schedule ----------
     void updateCountdown(time_t now, FirebaseData* fb, bool inWin) {
-        if (!schedEnable || schedStartMin < 0 || schedStopMin < 0) return;
+        if (!schedEnable || schedStartMin < 0 || schedStopMin < 0 || !fb) return;
 
         int h,m,s;
         getNowHMS(now,h,m,s);
@@ -95,14 +98,12 @@ private:
         int diff = 0;
 
         if (inWin) {
-            // กำลังทำงาน → นับถอยหลังถึง stop
             diff = stopSec - nowSec;
         } else {
-            // ยังไม่ถึงเวลาเริ่ม → นับไปถึง start
             if (nowSec <= startSec)
                 diff = startSec - nowSec;
             else
-                diff = 0;   // เลย stop แล้ว (วันนี้)
+                diff = 0;
         }
 
         if (diff < 0) diff = 0;
@@ -119,7 +120,7 @@ private:
             }
         }
 
-        if (shouldUpdate && fb != nullptr) {
+        if (shouldUpdate) {
             Firebase.RTDB.setInt(fb, PATH_SCHED_COUNTDOWN, diff);
             lastCountdownUpdate = millis();
             Serial.printf("[Schedule] Countdown = %d sec\n", diff);
@@ -135,8 +136,8 @@ private:
 
     // ---------- อ่าน config จาก Firebase ----------
     void fetchConfig(FirebaseData* fb) {
-        if (millis() - lastCfg < CONFIG_POLL_MS) return;
         if (!fb) return;
+        if (millis() - lastCfg < CONFIG_POLL_MS) return;
 
         // mode
         if (Firebase.RTDB.getString(fb, PATH_CTRL_MODE))
@@ -240,11 +241,11 @@ public:
         // 3) push ข้อมูลจาก Sensor Node ขึ้น Firebase
         pushSensorToFirebase(d, fb);
 
-        // 4) คำนวณ safety
+        // 4) คำนวณ safety (เงื่อนไขขึ้นกับ safetyEnabled)
         bool unsafe = false;
         String unsafeReason;
 
-        if (d.nodeId != 0) {
+        if (safetyEnabled && d.nodeId != 0) {
             if (d.waterPercent <= CONTROL_WATER_EMPTY_PCT) {
                 unsafe = true;
                 unsafeReason += "WATER_EMPTY";
@@ -285,24 +286,29 @@ public:
             }
         }
 
-        const char* safeStr     = unsafe ? "BLOCK" : "OK";
+        const char* safeStr;
+        if (!safetyEnabled) {
+            safeStr = "DISABLED";
+        } else {
+            safeStr = unsafe ? "BLOCK" : "OK";
+        }
         const char* schedNowStr = (schedEnable && inWin) ? "ON" : "OFF";
 
-        // 7) ส่งคำสั่งไป Sensor Node (CMD_CONTROL)
+        // 7) ส่งคำสั่งไป Sensor Node (control-only)
         if (want != lastCmd || millis() - lastSend > CMD_HEARTBEAT_MS) {
-            net->send(CMD_CONTROL, want);
+            net->send(want);
             lastCmd   = want;
             lastSend  = millis();
             lastCheck = millis();
 
-            Serial.printf("[Sent]  CMD=%s (mode=%s, sched_en=%s, sched_now=%s, safe=%s)\n",
+            Serial.printf("[Sent]  CMD=%s (mode=%s, sched_en=%s, sched_now=%s, safety=%s)\n",
                           want ? "ON" : "OFF",
                           mode.c_str(),
                           schedEnable ? "ON" : "OFF",
                           schedNowStr,
                           safeStr);
 
-            if (unsafe) {
+            if (unsafe && safetyEnabled) {
                 Serial.printf("[SAFETY] reason=%s (water=%d%%, tilt=%s)\n",
                               unsafeReason.c_str(),
                               d.waterPercent,
@@ -318,15 +324,15 @@ public:
             lastFbTime = millis();
         }
 
-        // 9) mismatch + auto recovery
-        if (millis() - lastCheck > 900) {
+        // 9) mismatch + auto recovery (เร็วขึ้น)
+        if (millis() - lastCheck > 400) {   // จาก 900 → 400ms
             if (want != fbState) {
                 if (mismatchCount < MAX_RECOVERY) {
                     mismatchCount++;
                     Serial.printf("⚠ CONTROL MISMATCH - attempt %d, resend CMD=%s\n",
                                   mismatchCount, want ? "ON" : "OFF");
 
-                    net->send(CMD_CONTROL, want);
+                    net->send(want);
                     lastSend  = millis();
                     lastCheck = millis();
                 } else {
